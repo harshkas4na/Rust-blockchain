@@ -4,10 +4,13 @@ mod blockchain;
 use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use serde::{Deserialize, Serialize};
 use blockchain::Blockchain;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use redis::{Commands, RedisError, Client};
+use tokio::task;
 
 struct AppState {
     blockchain: Mutex<Blockchain>,
+    redis_client: Client,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -23,6 +26,10 @@ async fn get_chain(data: web::Data<AppState>) -> impl Responder {
 async fn add_block(data: web::Data<AppState>, block_data: web::Json<AddBlockData>) -> impl Responder {
     let mut blockchain = data.blockchain.lock().unwrap();
     blockchain.add_block(block_data.data.clone());
+
+    let mut redis_conn = data.redis_client.get_connection().unwrap();
+    let _: () = redis_conn.publish("blockchain_updates", "A new block has been added").unwrap();
+
     HttpResponse::Ok().json(&*blockchain.chain)
 }
 
@@ -32,9 +39,30 @@ async fn is_valid(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(validity)
 }
 
+async fn redis_subscriber(client: Client) -> Result<(), RedisError> {
+    let con = Arc::new(Mutex::new(client.get_connection()?));
+    let pub_sub = con.clone();
+
+    task::spawn(async move {
+        let mut pub_sub = pub_sub.lock().unwrap();
+        let mut pub_sub = pub_sub.as_pubsub();
+        pub_sub.subscribe("blockchain_updates").unwrap();
+
+        loop {
+            let msg = pub_sub.get_message().unwrap();
+            let payload: String = msg.get_payload().unwrap();
+            println!("Received notification: {}", payload);
+        }
+    });
+
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Initialize the blockchain with a few blocks
+    let redis_client = Client::open("redis://localhost:6379").unwrap();
+    redis_subscriber(redis_client.clone()).await.unwrap();
+
     let mut my_blockchain = Blockchain::new();
     let mut count = 0;
     loop {
@@ -48,12 +76,11 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // Wrap the blockchain in a Mutex and shared state
     let app_state = web::Data::new(AppState {
         blockchain: Mutex::new(my_blockchain),
+        redis_client,
     });
 
-    // Start the Actix-web server
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
